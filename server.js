@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
 import { sign, verify } from 'hono/jwt';
-import bcrypt from 'bcryptjs';
 import Database from 'better-sqlite3';
 import { serve } from '@hono/node-server';
 
@@ -17,23 +16,14 @@ if (!JWT_SECRET) {
 const db = new Database('app.db', { verbose: null });
 db.pragma('journal_mode = WAL');
 
-// Execute full schema creation statements
+// Execute streamlined schema creation statements (License + Sessions only)
 db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
   CREATE TABLE IF NOT EXISTS licenses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
     license_key TEXT UNIQUE NOT NULL,
     expires_at DATETIME NOT NULL,
     max_devices INTEGER NOT NULL DEFAULT 1,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    is_active INTEGER NOT NULL DEFAULT 1
   );
 
   CREATE TABLE IF NOT EXISTS active_sessions (
@@ -46,20 +36,16 @@ db.exec(`
   );
 `);
 
-// Seed default test user on first run
-const existingUser = db.prepare('SELECT id FROM users WHERE email = ?').get('test@example.com');
-if (!existingUser) {
-  const passwordHash = bcrypt.hashSync('Password123!', 10);
-  const userResult = db.prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)').run('test@example.com', passwordHash);
-  const userId = userResult.lastInsertRowid;
-
+// Seed default test license key on first run
+const existingLicense = db.prepare('SELECT id FROM licenses WHERE license_key = ?').get('LICENSE-TEST-KEY-12345');
+if (!existingLicense) {
   const oneYearFromNow = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
   db.prepare(`
-    INSERT INTO licenses (user_id, license_key, expires_at, max_devices, is_active) 
-    VALUES (?, ?, ?, ?, ?)
-  `).run(userId, 'LICENSE-TEST-KEY-12345', oneYearFromNow, 2, 1);
+    INSERT INTO licenses (license_key, expires_at, max_devices, is_active) 
+    VALUES (?, ?, ?, ?)
+  `).run('LICENSE-TEST-KEY-12345', oneYearFromNow, 2, 1);
 
-  console.log('[Database] Seeded default test user: test@example.com / Password123!');
+  console.log('[Database] Seeded default test license key: LICENSE-TEST-KEY-12345 (Max Devices: 2)');
 }
 
 // ==========================================
@@ -87,34 +73,32 @@ app.use('/api/auth/*', async (c, next) => {
 });
 
 // ==========================================
-// 2. API ROUTE IMPLEMENTATIONS
+// 2. API ROUTE IMPLEMENTATIONS (License + HWID)
 // ==========================================
 
 app.post('/api/auth/login', async (c) => {
   try {
-    const { email, password, hwid_hash } = await c.req.json();
+    const { license_key, hwid_hash } = await c.req.json();
 
-    if (!email || !password || !hwid_hash) {
-      return c.json({ error: 'Missing required parameters: email, password, and hwid_hash' }, 400);
+    if (!license_key || !hwid_hash) {
+      return c.json({ error: 'Missing required parameters: license_key and hwid_hash' }, 400);
     }
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-      return c.json({ error: 'Invalid email or password' }, 401);
-    }
-
+    // Query active and valid license
     const license = db.prepare(`
       SELECT * FROM licenses 
-      WHERE user_id = ? AND is_active = 1 AND expires_at > datetime('now')
-    `).get(user.id);
+      WHERE license_key = ? AND is_active = 1 AND expires_at > datetime('now')
+    `).get(license_key);
 
     if (!license) {
-      return c.json({ error: 'No active or valid unexpired license found for this user account' }, 403);
+      return c.json({ error: 'Invalid, inactive, or expired license key' }, 403);
     }
 
+    // Fetch active sessions for this license
     const activeSessions = db.prepare('SELECT * FROM active_sessions WHERE license_id = ?').all(license.id);
     const existingSessionForDevice = activeSessions.find(s => s.hwid_hash === hwid_hash);
 
+    // Enforce device activation limits
     if (!existingSessionForDevice && activeSessions.length >= license.max_devices) {
       return c.json({
         error: 'License activation limit reached. Maximum allowed devices exceeded.',
@@ -143,7 +127,6 @@ app.post('/api/auth/login', async (c) => {
 
     const jwtPayload = {
       sessionId,
-      userId: user.id,
       licenseId: license.id,
       hwidHash: hwid_hash
     };
@@ -154,7 +137,7 @@ app.post('/api/auth/login', async (c) => {
     db.prepare('UPDATE active_sessions SET token_signature = ? WHERE id = ?').run(tokenSignature, sessionId);
 
     return c.json({
-      message: 'Authentication successful',
+      message: 'License activation successful',
       token,
       token_type: 'Bearer',
       expires_in: 86400,
@@ -172,7 +155,7 @@ app.post('/api/auth/login', async (c) => {
 
 app.post('/api/auth/validate', async (c) => {
   try {
-    const { sessionId, userId, licenseId, hwidHash } = c.get('jwtPayload');
+    const { sessionId, licenseId, hwidHash } = c.get('jwtPayload');
 
     const session = db.prepare(`
       SELECT * FROM active_sessions 
@@ -185,8 +168,8 @@ app.post('/api/auth/validate', async (c) => {
 
     const license = db.prepare(`
       SELECT * FROM licenses 
-      WHERE id = ? AND user_id = ? AND is_active = 1 AND expires_at > datetime('now')
-    `).get(licenseId, userId);
+      WHERE id = ? AND is_active = 1 AND expires_at > datetime('now')
+    `).get(licenseId);
 
     if (!license) {
       return c.json({ valid: false, error: 'Associated license is inactive or expired' }, 403);
